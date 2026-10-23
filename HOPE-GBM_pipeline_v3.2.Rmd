@@ -1,0 +1,1117 @@
+---
+title: "Glycolytic transcription, transcriptomic subtype and survival in IDH-wildtype glioblastoma"
+subtitle: "Reproducible pipeline v3.2 (2026-09-20): CGGA GSVA on log2(RSEM + 1) in Layers 05 and 05b, matching Layer 06; otherwise identical to v3.1"
+author: "Manrique-Guzmán S, Gutiérrez-Salmeán G, Albores-Méndez EM, Castro-Marín M, Uribe-Figueroa LI"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+```
+
+# Overview
+
+End-to-end pipeline. Discovery in TCGA-GBM (Illumina RNA-seq, GDC STAR-Counts);
+external validation in CGGA-693 and CGGA-325. Fixed seed, versioned package
+manifest, layers executed in strict order.
+
+**v3.1 versus v3 (HOPE-GBM_10):**
+
+1. CGGA expression files in `~/Documents/CGGA_local` may carry embedded NUL
+   bytes or UTF-16 encoding, and duplicated gene symbols. They are now read
+   through `readLines(skipNul = TRUE)`, the header is repaired when it has one
+   field fewer than the data rows, `row.names = NULL` is forced, and duplicate
+   symbols are collapsed by highest mean.
+2. `run_gsva()` sanitises its input (numeric mode, no all-NA columns, no rows
+   with NA, no zero-variance rows) and prints the real error of `gsvaParam`
+   before trying the legacy call.
+3. Layer 06 runs only when `CHEN2017_GGESS` is non-empty. With the vector
+   empty the layer is skipped with a message and Layer 07 exports every other
+   table and figure. Table 4, Table S3, Figure 3 and Figure S3 appear once the
+   ten genes are transcribed into Layer 00.
+
+Unchanged from v3: export tree `Sep_06/{Tables,Figures}`; log-rank across
+cohorts in Table 1; C-index base versus full model in Table 2; Layer 01 runs
+only when `data_raw/tcga_gbm_SE.rds` is absent; paths resolve through `~`.
+
+Outputs consumed by the manuscript:
+
+| Manuscript element | File (under `Sep_06/`) |
+|---|---|
+| Table 1 (baseline, three cohorts) | `Tables/Table1_baseline_characteristics.docx` |
+| Table 2 (HR per cohort, MGMT-adjusted, C-index base vs full) | `Tables/Table2_glycolytic_score_survival.docx` |
+| Table 3 (full TCGA Cox model) | `Tables/Table3_TCGA_multivariable_Cox.docx` |
+| Table 4 (GGESS with and without subtype, three cohorts) | `Tables/Table4_GGESS_subtype_attenuation.docx` |
+| Figure 1 (forest plot, HALLMARK score) | `Figures/Figure1_forest_plot.png/.tif` |
+| Figure 2 (KM by tertile, TCGA) | `Figures/Figure2_KM_tertiles.png/.tif` |
+| Figure 3 (GGESS HR before vs after subtype adjustment) | `Figures/Figure3_GGESS_attenuation.png/.tif` |
+| Supplementary Figure S1 (Schoenfeld, age-band model) | `Figures/FigureS1_agebandstrat_zph.png/.tif` |
+| Supplementary Figure S2 (HALLMARK score by subtype) | `Figures/FigureS2_glyco_by_subtype.png/.tif` |
+| Supplementary Figure S3 (GGESS by subtype) | `Figures/FigureS3_GGESS_by_subtype.png/.tif` |
+| Supplementary Table S1 (HALLMARK Cox adjusted for subtype) | `Tables/TableS1_cox_subtype.docx` |
+| Supplementary Table S2 (TCGA published vs GSVA subtype) | `Tables/TableS2_subtype_concordance.docx` |
+| Supplementary Table S3 (per-gene GGESS Cox in TCGA, rederived weights) | `Tables/TableS3_GGESS_gene_coefficients.docx` |
+| Every number cited in the text | `manuscript_numbers.txt` |
+
+---
+
+# Layer 00 — Environment, seed, paths, logging
+
+```{r layer-00-setup}
+## ---- Fixed global seed (reproducibility) ---------------------------
+set.seed(1024)
+
+## ---- Analysis switches --------------------------------------------
+CGGA_PRIMARY_ONLY <- TRUE   # FALSE reproduces the 1-Sep CGGA cohorts (rGBM/sGBM included)
+CGGA_ADJUST_MGMT  <- TRUE   # FALSE reproduces the 1-Sep CGGA models (age only)
+
+## ---- Project paths --------------------------------------------------
+## Set HOPE_GBM_DIR to the project folder (containing data_raw/), or run from that folder.
+KNOWN_PROJ <- c(Sys.getenv("HOPE_GBM_DIR", unset = NA_character_),
+                path.expand("~/HOPE-GBM"))
+
+rmd_path <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) NA_character_)
+if (is.na(rmd_path) || !nzchar(rmd_path)) {
+  rmd_path <- tryCatch(knitr::current_input(dir = TRUE), error = function(e) NA_character_)
+}
+looks_like_project <- function(p) !is.na(p) && nzchar(p) && dir.exists(file.path(p, "data_raw"))
+candidates <- c(
+  KNOWN_PROJ,
+  if (!is.na(rmd_path) && nzchar(rmd_path)) dirname(rmd_path) else NA_character_,
+  normalizePath(file.path(dirname(getwd()), "HOPE-GBM"), mustWork = FALSE)
+)
+hit  <- Find(looks_like_project, candidates)
+PROJ <- if (!is.null(hit)) hit else getwd()
+if (!dir.exists(file.path(PROJ, "data_raw"))) {
+  warning("PROJ resolved to '", PROJ, "' but it does not contain data_raw/. ",
+          "Set KNOWN_PROJ in this chunk to the real project path.")
+}
+DIR_RAW  <- file.path(PROJ, "data_raw")
+DIR_PROC <- file.path(PROJ, "data_processed")
+DIR_RES  <- file.path(PROJ, "results")
+DIR_LOG  <- file.path(PROJ, "logs")
+## CGGA source: first existing directory wins. Data are already downloaded; never re-download.
+## Set CGGA_DIR to the folder holding the CGGA mRNAseq_693/325 expression and clinical files.
+CGGA_CANDIDATES <- c(Sys.getenv("CGGA_DIR", unset = NA_character_),
+                     path.expand("~/Documents/CGGA_local"),
+                     file.path(DIR_RAW, "CGGA"))
+CGGA_DIR <- Find(function(p) dir.exists(p) &&
+                   length(list.files(p, pattern = "mRNAseq.*genes.*[.]txt$")) > 0, CGGA_CANDIDATES)
+if (is.null(CGGA_DIR)) stop("No CGGA expression files found in: ", paste(CGGA_CANDIDATES, collapse = " | "))
+## v3 export tree
+DIR_OUT  <- file.path(PROJ, "Sep_06")
+DIR_TAB  <- file.path(DIR_OUT, "Tables")
+DIR_FIG  <- file.path(DIR_OUT, "Figures")
+for (d in c(DIR_RAW, DIR_PROC, DIR_RES, DIR_LOG, DIR_OUT, DIR_TAB, DIR_FIG))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+## ---- Glycolytic signature FROZEN before touching any data ----------
+PANEL_WARBURG <- c("SLC2A1", "HK2", "LDHA", "PDK1", "SLC2A3")
+
+## ---- Chen 2017 GGESS (J Genet Genomics 2017;44:519-530) -------------
+## TRANSCRIBE FROM THE FULL TEXT. The ten genes are not in the abstract.
+## Option 1 (preferred): named numeric vector of the published Cox
+## coefficients, e.g. c(GENE1 = 0.31, GENE2 = -0.12, ...). Layer 06 then
+## reproduces the published risk score exactly.
+## Option 2: character vector of the ten symbols only; Layer 06 falls back
+## to TCGA-rederived weights and an unweighted mean.
+## While both are empty, Layer 06 is skipped and the rest of the pipeline runs.
+CHEN2017_GGESS_COEF <- c(ALDOB = -0.414, ENO1 = 0.218, GALM = 0.242, GAPDH = 0.194, HK2 = 0.211, HK3 = 0.319, LDHA = 0.269, LDHB = -0.296, PKLR = -0.181, PKM = 0.213)   # Chen 2017, Table 1; PKM2 = HGNC PKM
+CHEN2017_GGESS      <- c()        # character; if COEF is given, names(COEF) are used
+if (length(CHEN2017_GGESS_COEF) > 0) CHEN2017_GGESS <- names(CHEN2017_GGESS_COEF)
+RUN_LAYER06 <- length(CHEN2017_GGESS) > 0
+
+## ---- Reporting constants -------------------------------------------
+DAYS_PER_MONTH <- 30.4375
+FIG_DPI        <- 600
+
+## ---- Packages ------------------------------------------------------
+.pkgs <- c("TCGAbiolinks","SummarizedExperiment","DESeq2","GSVA",
+           "msigdbr","survival","survminer","gtsummary","dplyr","readr","ggplot2",
+           "flextable","officer","tibble")
+invisible(lapply(.pkgs, function(p)
+  if (!requireNamespace(p, quietly = TRUE))
+    stop("Missing package: ", p, ". Install it before continuing.")))
+suppressPackageStartupMessages({ library(dplyr); library(readr); library(ggplot2) })
+
+## ---- Minimal timestamped logger ------------------------------------
+log_msg <- function(...) {
+  msg <- paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] ", ...)
+  cat(msg, "\n")
+  cat(msg, "\n", file = file.path(DIR_LOG, "hope_run.log"), append = TRUE)
+}
+
+## ---- Figure exporter: PNG + TIFF (LZW) at FIG_DPI ------------------
+save_fig <- function(obj, stem, width, height, dpi = FIG_DPI) {
+  png(paste0(stem, ".png"), width = width, height = height, units = "in", res = dpi)
+  print(obj); dev.off()
+  tiff(paste0(stem, ".tif"), width = width, height = height, units = "in", res = dpi,
+       compression = "lzw")
+  print(obj); dev.off()
+  invisible(stem)
+}
+
+## ---- Shared helpers --------------------------------------------------
+harmonize_sex <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  out <- ifelse(grepl("^f", x), "Female", ifelse(grepl("^m", x), "Male", NA_character_))
+  factor(out, levels = c("Female", "Male"))
+}
+harmonize_mgmt <- function(x) {
+  x <- tolower(gsub("[^a-z]", "", tolower(as.character(x))))
+  out <- ifelse(x == "methylated", "Methylated",
+         ifelse(x == "unmethylated", "Unmethylated", NA_character_))
+  factor(out, levels = c("Methylated", "Unmethylated"))
+}
+ft_style <- function(ft) {
+  ft %>% flextable::font(fontname = "Helvetica", part = "all") %>%
+    flextable::fontsize(size = 11, part = "all") %>%
+    flextable::border_remove() %>%
+    flextable::hline_top(part = "header", border = officer::fp_border(width = 0.5)) %>%
+    flextable::hline_bottom(part = "header", border = officer::fp_border(width = 0.5)) %>%
+    flextable::hline_bottom(part = "body", border = officer::fp_border(width = 0.5)) %>%
+    flextable::align(align = "center", part = "all") %>%
+    flextable::align(j = 1, align = "left", part = "all") %>%
+    flextable::autofit()
+}
+## One GSVA wrapper for every layer. Sanitises the matrix (the new gsvaParam
+## API rejects NA cells and zero-variance rows) and exposes the real error.
+run_gsva <- function(mat, sets) {
+  m <- as.matrix(mat); mode(m) <- "numeric"
+  m <- m[, colSums(is.na(m)) < nrow(m), drop = FALSE]          # drop all-NA columns
+  m <- m[rowSums(is.na(m)) == 0, , drop = FALSE]               # drop rows with any NA
+  m <- m[apply(m, 1, function(r) sd(r) > 0), , drop = FALSE]  # drop zero-variance rows
+  if (nrow(m) < 1000 || ncol(m) < 10)
+    stop("run_gsva: matrix too small after sanitising (", nrow(m), " x ", ncol(m), ")")
+  tryCatch(GSVA::gsva(GSVA::gsvaParam(exprData = m, geneSets = sets, kcdf = "Gaussian")),
+           error = function(e) {
+             message("gsvaParam failed: ", conditionMessage(e), " -> trying legacy call")
+             GSVA::gsva(m, sets, kcdf = "Gaussian", verbose = FALSE)
+           })
+}
+zrow <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+## HR extractor used by Layers 06 and 07
+hr_row <- function(fit, label, term) {
+  ci <- summary(fit)$conf.int[term, ]
+  data.frame(cohort = label, n = fit$n, deaths = fit$nevent,
+             HR = unname(ci["exp(coef)"]), lo = unname(ci["lower .95"]), hi = unname(ci["upper .95"]),
+             p = summary(fit)$coefficients[term, "Pr(>|z|)"],
+             cindex = unname(summary(fit)$concordance[1]), row.names = NULL)
+}
+## Robust reader for CGGA expression tables (NUL bytes, UTF-16, short header, duplicate symbols)
+read_cgga_expr <- function(path, label) {
+  ## Byte-level read and manual tab split. read.delim() is avoided on purpose:
+  ## quotes and # characters inside the CGGA files break its parser, and one of
+  ## the two files is not valid UTF-8.
+  con <- file(path, open = "rb")
+  ln  <- readLines(con, skipNul = TRUE, warn = FALSE, encoding = "latin1"); close(con)
+  ln  <- gsub("\r$", "", ln, useBytes = TRUE)
+  ln  <- ln[nzchar(ln, keepNA = FALSE)]
+  fl  <- strsplit(ln, "\t", fixed = TRUE, useBytes = TRUE)
+  nf  <- lengths(fl)
+  ncol_data <- as.integer(names(sort(table(nf[-1]), decreasing = TRUE))[1])
+  hdr <- fl[[1]]
+  ids <- if (length(hdr) == ncol_data) hdr[-1] else hdr   # header may omit the gene column
+  body <- fl[-1][nf[-1] == ncol_data]
+  log_msg(sprintf("%s raw: %d lines, %d fields/row, %d sample IDs, %d rows kept",
+                  label, length(ln), ncol_data, length(ids), length(body)))
+  stopifnot(length(ids) > 10, length(body) > 1000)
+  gene <- enc2utf8(vapply(body, `[`, "", 1L))
+  expr <- matrix(suppressWarnings(as.numeric(unlist(lapply(body, `[`, -1L), use.names = FALSE))),
+                 nrow = length(body), ncol = length(ids), byrow = TRUE,
+                 dimnames = list(NULL, ids))
+  ok   <- !is.na(gene) & nzchar(gene) & rowSums(!is.na(expr)) > 0
+  expr <- expr[ok, , drop = FALSE]; gene <- gene[ok]
+  ord  <- order(rowMeans(expr, na.rm = TRUE), decreasing = TRUE)
+  expr <- expr[ord, , drop = FALSE]; gene <- gene[ord]
+  dup  <- duplicated(gene)
+  expr <- expr[!dup, , drop = FALSE]; rownames(expr) <- gene[!dup]
+  log_msg(sprintf("%s expression: %d genes (collapsed %d duplicates); %d samples; NA cells=%d",
+                  label, nrow(expr), sum(dup), ncol(expr), sum(is.na(expr))))
+  stopifnot(nrow(expr) > 1000, ncol(expr) > 10)
+  expr
+}
+
+writeLines(capture.output(sessionInfo()),
+           file.path(DIR_LOG, paste0("sessionInfo_", Sys.Date(), ".txt")))
+log_msg("PROJ resolved to: ", PROJ)
+log_msg("CGGA_DIR resolved to: ", CGGA_DIR)
+log_msg("Setup complete (v3.2). Seed=1024. CGGA_PRIMARY_ONLY=", CGGA_PRIMARY_ONLY,
+        "; CGGA_ADJUST_MGMT=", CGGA_ADJUST_MGMT, "; outputs -> ", DIR_OUT)
+log_msg("CHEN2017_GGESS: ", if (RUN_LAYER06) paste(CHEN2017_GGESS, collapse = ",") else "EMPTY (Layer 06 will be skipped)")
+```
+
+---
+
+# Layer 01 — TCGA-GBM acquisition (Illumina RNA-seq, STAR-Counts)
+
+Runs only if `data_raw/tcga_gbm_SE.rds` is missing.
+
+```{r layer-01-acquire-tcga, eval=!file.exists(file.path(DIR_RAW, "tcga_gbm_SE.rds"))}
+suppressPackageStartupMessages({ library(TCGAbiolinks); library(SummarizedExperiment) })
+query_tcga <- GDCquery(
+  project = "TCGA-GBM", data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification", workflow.type = "STAR - Counts",
+  experimental.strategy = "RNA-Seq")
+log_msg("Downloading TCGA-GBM RNA-seq (Illumina/STAR) from GDC...")
+GDCdownload(query_tcga, directory = file.path(DIR_RAW, "GDCdata"))
+se_tcga <- GDCprepare(query_tcga, directory = file.path(DIR_RAW, "GDCdata"),
+                      summarizedExperiment = TRUE)
+log_msg(sprintf("SummarizedExperiment assembled: %d genes x %d samples.", nrow(se_tcga), ncol(se_tcga)))
+subtype_gbm <- tryCatch(TCGAquery_subtype(tumor = "gbm"),
+  error = function(e) { log_msg("Warning: TCGAquery_subtype failed: ", conditionMessage(e)); NULL })
+saveRDS(se_tcga,     file.path(DIR_RAW, "tcga_gbm_SE.rds"))
+saveRDS(subtype_gbm, file.path(DIR_RAW, "tcga_gbm_subtype.rds"))
+log_msg("Saved data_raw/tcga_gbm_SE.rds and tcga_gbm_subtype.rds")
+```
+
+---
+
+# Layer 02 — Cleaning, QC, WHO 2021 filter (IDH-wildtype GBM), VST, overall survival
+
+```{r layer-02-clean-filter}
+suppressPackageStartupMessages({ library(SummarizedExperiment); library(DESeq2) })
+
+se      <- readRDS(file.path(DIR_RAW, "tcga_gbm_SE.rds"))
+subtype <- readRDS(file.path(DIR_RAW, "tcga_gbm_subtype.rds"))
+
+## 1. Primary tumour only (sample code 01)
+se <- se[, substr(colnames(se), 14, 15) == "01"]
+log_msg(sprintf("After primary-tumor filter (01): %d samples.", ncol(se)))
+
+## 2. One sample per patient
+patient <- substr(colnames(se), 1, 12)
+se <- se[, !duplicated(patient)]
+colnames(se) <- substr(colnames(se), 1, 12)
+log_msg(sprintf("After per-patient deduplication: %d patients.", ncol(se)))
+
+## 3. WHO 2021 molecular filter: IDH-wildtype
+if (!is.null(subtype) && "IDH.status" %in% colnames(subtype)) {
+  idh <- subtype[match(colnames(se), subtype$patient), "IDH.status"]
+  wt  <- which(tolower(idh) %in% c("wt","wildtype","idh-wt","idh wildtype"))
+  if (length(wt) > 0) {
+    se <- se[, wt]
+    log_msg(sprintf("After IDH-wildtype filter: %d patients.", ncol(se)))
+  } else log_msg("WARNING: IDH.status has no clear matches; review manually.")
+} else log_msg("WARNING: no IDH.status available; WHO 2021 filter unresolved.")
+
+## 4. Overall survival
+cd <- as.data.frame(colData(se))
+os_time <- ifelse(!is.na(cd$days_to_death), cd$days_to_death, cd$days_to_last_follow_up)
+event   <- ifelse(tolower(cd$vital_status) == "dead", 1L, 0L)
+sex_col <- if ("gender" %in% colnames(cd)) cd$gender else
+           if ("sex_at_birth" %in% colnames(cd)) cd$sex_at_birth else rep(NA_character_, nrow(cd))
+clin <- data.frame(patient = colnames(se), OS.time = as.numeric(os_time), OS.event = event,
+                   age = as.numeric(cd$age_at_index), sex = sex_col, stringsAsFactors = FALSE)
+if (!is.null(subtype)) {
+  mcol <- grep("MGMT", colnames(subtype), value = TRUE, ignore.case = TRUE)[1]
+  if (!is.na(mcol)) clin$MGMT <- as.character(subtype[match(clin$patient, subtype$patient), mcol])
+}
+clin <- clin[!is.na(clin$OS.time) & clin$OS.time > 0, ]
+se   <- se[, clin$patient]
+log_msg(sprintf("Patients with valid OS: %d (events=%d).", nrow(clin), sum(clin$OS.event)))
+log_msg(sprintf("Sex recovered in TCGA: %d of %d patients.", sum(!is.na(clin$sex)), nrow(clin)))
+
+## 5. VST (DESeq2)
+cts <- assay(se, "unstranded"); mode(cts) <- "integer"
+dds <- DESeqDataSetFromMatrix(cts, colData = DataFrame(clin), design = ~ 1)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+vst_mat <- assay(vst(dds, blind = TRUE))
+
+## 6. Ensembl -> symbol (collapse duplicates by highest mean)
+gsym <- rowData(se)$gene_name[match(rownames(vst_mat), rownames(se))]
+ok <- !is.na(gsym) & gsym != ""
+vst_mat <- vst_mat[ok, ]; gsym <- gsym[ok]
+ord <- order(rowMeans(vst_mat), decreasing = TRUE)
+vst_mat <- vst_mat[ord, ]; gsym <- gsym[ord]
+vst_mat <- vst_mat[!duplicated(gsym), ]; rownames(vst_mat) <- gsym[!duplicated(gsym)]
+
+saveRDS(vst_mat, file.path(DIR_PROC, "tcga_vst.rds"))
+saveRDS(clin,    file.path(DIR_PROC, "tcga_clin.rds"))
+log_msg(sprintf("Saved tcga_vst.rds (%d genes) and tcga_clin.rds.", nrow(vst_mat)))
+```
+
+---
+
+# Layer 03 — Glycolytic score: GSVA `HALLMARK_GLYCOLYSIS` (primary) + panel (secondary)
+
+```{r layer-03-glyco-score}
+suppressPackageStartupMessages({ library(GSVA); library(msigdbr) })
+vst_mat <- readRDS(file.path(DIR_PROC, "tcga_vst.rds"))
+
+hm <- tryCatch(msigdbr(species = "Homo sapiens", category = "H"),
+               error = function(e) msigdbr(species = "Homo sapiens", collection = "H"))
+glyco_set <- hm %>% dplyr::filter(gs_name == "HALLMARK_GLYCOLYSIS") %>%
+  dplyr::pull(gene_symbol) %>% unique()
+log_msg(sprintf("HALLMARK_GLYCOLYSIS: %d genes; present: %d.",
+                length(glyco_set), sum(glyco_set %in% rownames(vst_mat))))
+
+glyco_gsva <- as.numeric(run_gsva(vst_mat, list(HALLMARK_GLYCOLYSIS = glyco_set))["HALLMARK_GLYCOLYSIS", ])
+
+present <- intersect(PANEL_WARBURG, rownames(vst_mat))
+log_msg(sprintf("Warburg panel present: %s", paste(present, collapse = ", ")))
+panel_z <- colMeans(t(apply(vst_mat[present, , drop = FALSE], 1, zrow)))
+
+scores <- data.frame(patient = colnames(vst_mat), glyco_gsva = glyco_gsva,
+                     panel_z = as.numeric(panel_z), stringsAsFactors = FALSE)
+saveRDS(scores, file.path(DIR_PROC, "tcga_scores.rds"))
+saveRDS(glyco_set, file.path(DIR_PROC, "glyco_set.rds"))
+log_msg("Saved tcga_scores.rds and glyco_set.rds.")
+```
+
+---
+
+# Layer 04 — Cox regression (OS), PH check, KM by tertile (TCGA)
+
+```{r layer-04-survival}
+suppressPackageStartupMessages({ library(survival); library(survminer); library(gtsummary) })
+
+clin   <- readRDS(file.path(DIR_PROC, "tcga_clin.rds"))
+scores <- readRDS(file.path(DIR_PROC, "tcga_scores.rds"))
+df <- merge(clin, scores, by = "patient")
+df$glyco_z <- as.numeric(scale(df$glyco_gsva))
+df$sex     <- harmonize_sex(df$sex)
+
+covars <- c("glyco_z", "age")
+if ("MGMT" %in% names(df) && sum(!is.na(df$MGMT)) >= 0.7 * nrow(df)) {
+  df$MGMT <- harmonize_mgmt(df$MGMT); covars <- c(covars, "MGMT")
+} else log_msg("MGMT absent or too incomplete in TCGA: excluded from the main model.")
+frm <- as.formula(paste("Surv(OS.time, OS.event) ~", paste(covars, collapse = " + ")))
+cox <- coxph(frm, data = df)
+## Base model (no score) on the same complete cases, for the C-index comparison
+cox_base <- coxph(update(frm, . ~ . - glyco_z), data = df[complete.cases(df[, covars]), ])
+log_msg("Adjusted Cox fitted. HR (glyco_z) = ", signif(exp(coef(cox)["glyco_z"]), 3),
+        "; C-index base=", round(summary(cox_base)$concordance[1], 3),
+        " full=", round(summary(cox)$concordance[1], 3))
+
+saveRDS(cox,      file.path(DIR_RES, "tcga_cox.rds"))
+saveRDS(cox_base, file.path(DIR_RES, "tcga_cox_base.rds"))
+writeLines(capture.output(summary(cox)), file.path(DIR_RES, "tcga_cox_summary.txt"))
+
+zph <- cox.zph(cox)
+saveRDS(zph, file.path(DIR_RES, "tcga_cox_zph.rds"))
+writeLines(capture.output(print(zph)), file.path(DIR_RES, "tcga_cox_zph.txt"))
+
+## KM by tertile (defined in the full IDH-wt cohort)
+df$glyco_tertile <- cut(df$glyco_gsva,
+                        breaks = quantile(df$glyco_gsva, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                        labels = c("Low","Mid","High"), include.lowest = TRUE)
+fit  <- survfit(Surv(OS.time, OS.event) ~ glyco_tertile, data = df)
+lr   <- survdiff(Surv(OS.time, OS.event) ~ glyco_tertile, data = df)
+lr_p <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+writeLines(c(sprintf("Log-rank chi-square = %.3f on %d df", lr$chisq, length(lr$n) - 1),
+             sprintf("p = %.4f", lr_p),
+             paste("Tertile sizes:", paste(names(table(df$glyco_tertile)),
+                                            table(df$glyco_tertile), sep = "=", collapse = ", "))),
+           file.path(DIR_RES, "tcga_KM_logrank.txt"))
+log_msg(sprintf("KM by tertile: log-rank p=%.3f", lr_p))
+
+km <- ggsurvplot(fit, data = df,
+                 pval = sprintf("Log-rank p = %.2f", lr_p), pval.coord = c(1, 0.12),
+                 risk.table = TRUE, risk.table.height = 0.25,
+                 xscale = "d_m", break.time.by = 365.25,
+                 xlab = "Months", ylab = "Overall survival",
+                 legend.title = "Glycolytic score", legend.labs = c("Low", "Mid", "High"),
+                 legend = "bottom", censor.size = 3,
+                 palette = c("#D55E00", "#009E73", "#0072B2"),
+                 ggtheme = theme_classic(base_size = 11))
+save_fig(km, file.path(DIR_FIG, "Figure2_KM_tertiles"), width = 7, height = 6.5)
+saveRDS(df, file.path(DIR_PROC, "tcga_model_df.rds"))
+log_msg("TCGA survival complete. Figure 2 exported to Sep_06/Figures.")
+```
+
+```{r layer-04-km-inline, fig.width=7, fig.height=6.5}
+km
+```
+
+---
+
+# Layer 04b — Sensitivity: Cox model stratified by age band
+
+```{r layer-04b-age-band-sensitivity}
+suppressPackageStartupMessages({ library(survival) })
+df <- readRDS(file.path(DIR_PROC, "tcga_model_df.rds"))
+df$age_band <- cut(df$age, breaks = quantile(df$age, c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                   include.lowest = TRUE, labels = c("T1_youngest", "T2_mid", "T3_oldest"))
+covars <- c("glyco_z", if ("MGMT" %in% names(df)) "MGMT")
+frm <- as.formula(paste("Surv(OS.time, OS.event) ~", paste(covars, collapse = " + "), "+ strata(age_band)"))
+cox_strat <- coxph(frm, data = df)
+log_msg("Age-band-stratified Cox: HR (glyco_z) = ", signif(exp(coef(cox_strat)["glyco_z"]), 3))
+saveRDS(cox_strat, file.path(DIR_RES, "tcga_cox_agebandstrat.rds"))
+writeLines(capture.output(summary(cox_strat)), file.path(DIR_RES, "tcga_cox_agebandstrat_summary.txt"))
+zph_strat <- cox.zph(cox_strat)
+saveRDS(zph_strat, file.path(DIR_RES, "tcga_cox_agebandstrat_zph.rds"))
+writeLines(capture.output(print(zph_strat)), file.path(DIR_RES, "tcga_cox_agebandstrat_zph.txt"))
+p_zph <- survminer::ggcoxzph(zph_strat)
+save_fig(p_zph, file.path(DIR_FIG, "FigureS1_agebandstrat_zph"), width = 8, height = 4.5)
+log_msg("Figure S1 exported.")
+```
+
+```{r layer-04b-zph-inline, fig.width=8, fig.height=4.5}
+p_zph
+```
+
+---
+
+# Layer 05 — External validation in CGGA (RNA-seq, MGMT-adjusted). Never pooled with TCGA.
+
+```{r layer-05-validate-cgga}
+suppressPackageStartupMessages({ library(GSVA); library(msigdbr); library(survival) })
+glyco_set <- readRDS(file.path(DIR_PROC, "glyco_set.rds"))
+
+cgga_dir <- CGGA_DIR
+expr_f <- list.files(cgga_dir, pattern = "mRNAseq.*genes.*[.]txt$", full.names = TRUE)
+clin_f <- list.files(cgga_dir, pattern = "clinical.*[.]txt$",           full.names = TRUE)
+if (length(expr_f) == 0 || length(clin_f) == 0)
+  stop("CGGA expression or clinical files not found in ", cgga_dir)
+log_msg("CGGA files: ", paste(basename(c(expr_f, clin_f)), collapse = " | "))
+num_of <- function(p) regmatches(basename(p), regexpr("325|693", basename(p)))
+clin_f <- clin_f[match(vapply(expr_f, num_of, ""), vapply(clin_f, num_of, ""))]
+stopifnot(!any(is.na(clin_f)))
+
+pick_col <- function(nm, exact, pattern) {
+  hit <- exact[exact %in% nm]
+  if (length(hit)) return(hit[1])
+  grep(pattern, nm, value = TRUE, ignore.case = TRUE)[1]
+}
+
+run_cgga <- function(expr_path, clin_path) {
+  label <- paste0("CGGA-", num_of(expr_path))
+  expr  <- read_cgga_expr(expr_path, label)
+  ## CGGA clinical files carry CR line endings: readr handles CR/CRLF/LF.
+  clin <- as.data.frame(readr::read_tsv(clin_path, show_col_types = FALSE, progress = FALSE))
+  if (nrow(clin) < 50) stop(label, ": clinical file read as ", nrow(clin), " rows; check line endings.")
+  nm <- colnames(clin)
+  id_col   <- pick_col(nm, "CGGA_ID", "CGGA|sample|ID")
+  prs_col  <- pick_col(nm, "PRS_type", "PRS")
+  hist_col <- pick_col(nm, "Histology", "Histology")
+  idh_col  <- pick_col(nm, "IDH_mutation_status", "IDH")
+  mgmt_col <- pick_col(nm, "MGMTp_methylation_status", "MGMT")
+  sex_col  <- pick_col(nm, "Gender", "Gender|Sex")
+  age_col  <- pick_col(nm, "Age", "Age")
+  os_col   <- pick_col(nm, "OS", "^OS$|overall")
+  ev_col   <- grep("Censor", nm, value = TRUE, ignore.case = TRUE)[1]
+
+  n0 <- nrow(clin)
+  keep <- grepl("GBM", clin[[hist_col]], ignore.case = TRUE) &
+          grepl("wildtype|wt", clin[[idh_col]], ignore.case = TRUE)
+  n_gbm_wt <- sum(keep, na.rm = TRUE)
+  if (CGGA_PRIMARY_ONLY && !is.na(prs_col)) keep <- keep & clin[[prs_col]] == "Primary"
+  keep[is.na(keep)] <- FALSE
+  clin <- clin[keep, ]
+  log_msg(sprintf("%s: %d rows -> %d IDH-wt GBM (any PRS) -> %d after PRS filter (CGGA_PRIMARY_ONLY=%s)",
+                  label, n0, n_gbm_wt, nrow(clin), CGGA_PRIMARY_ONLY))
+
+  ids  <- intersect(clin[[id_col]], colnames(expr))
+  if (length(ids) < 20) stop(label, ": only ", length(ids), " IDs shared between clinical and expression files.")
+  expr <- as.matrix(expr[, ids, drop = FALSE]); clin <- clin[match(ids, clin[[id_col]]), ]
+
+  ## v3.2 (2026-09-20): GSVA on log2(RSEM + 1), the same scale Layer 06 uses for
+  ## the published signatures. Before v3.2 this call ran on raw RSEM, an
+  ## inconsistency flagged during manuscript audit. `expr` is kept raw for 06+.
+  gs <- run_gsva(log2(expr + 1), list(HALLMARK_GLYCOLYSIS = glyco_set))
+  glyco_gsva <- as.numeric(gs["HALLMARK_GLYCOLYSIS", ids])
+
+  dd <- data.frame(patient = ids,
+                   OS.time = as.numeric(clin[[os_col]]),
+                   OS.event = as.integer(clin[[ev_col]]),
+                   glyco_gsva = glyco_gsva,
+                   glyco_z = as.numeric(scale(glyco_gsva)),
+                   age = suppressWarnings(as.numeric(clin[[age_col]])),
+                   sex = if (!is.na(sex_col)) as.character(clin[[sex_col]]) else NA_character_,
+                   MGMT = if (!is.na(mgmt_col)) as.character(clin[[mgmt_col]]) else NA_character_,
+                   stringsAsFactors = FALSE)
+  dd <- dd[!is.na(dd$OS.time) & dd$OS.time > 0, ]
+  dd$MGMT <- harmonize_mgmt(dd$MGMT)
+  log_msg(sprintf("%s: analysed n=%d, events=%d, MGMT known in %d (%s)", label, nrow(dd),
+                  sum(dd$OS.event), sum(!is.na(dd$MGMT)),
+                  paste(names(table(dd$MGMT)), table(dd$MGMT), sep = "=", collapse = ", ")))
+
+  use_mgmt <- CGGA_ADJUST_MGMT && sum(!is.na(dd$MGMT)) >= 0.7 * nrow(dd)
+  rhs <- if (use_mgmt) "glyco_z + age + MGMT" else "glyco_z + age"
+  cox <- coxph(as.formula(paste("Surv(OS.time, OS.event) ~", rhs)), data = dd)
+  cc  <- dd[complete.cases(dd[, c("glyco_z", "age", if (use_mgmt) "MGMT")]), ]
+  cox_base <- coxph(as.formula(paste("Surv(OS.time, OS.event) ~", sub("glyco_z \\+ ", "", rhs))), data = cc)
+  cox_age_only <- coxph(Surv(OS.time, OS.event) ~ glyco_z + age, data = dd)
+  list(label = label, cox = cox, cox_base = cox_base, cox_age_only = cox_age_only,
+       data = dd, mgmt_adjusted = use_mgmt, expr = expr)
+}
+
+cgga <- base::Map(run_cgga, expr_f, clin_f)
+names(cgga) <- vapply(cgga, `[[`, "", "label")
+for (k in names(cgga)) {
+  writeLines(capture.output(summary(cgga[[k]]$cox)),
+             file.path(DIR_RES, sprintf("cgga_cox_%s.txt", sub("CGGA-", "", k))))
+  writeLines(capture.output(summary(cgga[[k]]$cox_age_only)),
+             file.path(DIR_RES, sprintf("cgga_cox_%s_ageonly.txt", sub("CGGA-", "", k))))
+  log_msg(sprintf("%s: HR(glyco_z)=%.3f [MGMT-adjusted=%s]; age-only HR=%.3f; C base=%.3f full=%.3f", k,
+                  exp(coef(cgga[[k]]$cox)["glyco_z"]), cgga[[k]]$mgmt_adjusted,
+                  exp(coef(cgga[[k]]$cox_age_only)["glyco_z"]),
+                  summary(cgga[[k]]$cox_base)$concordance[1], summary(cgga[[k]]$cox)$concordance[1]))
+}
+## Expression matrices kept in memory for Layers 05b and 06
+cgga_expr <- lapply(cgga, `[[`, "expr")
+cgga <- lapply(cgga, function(x) { x$expr <- NULL; x })
+saveRDS(cgga, file.path(DIR_RES, "cgga_cox_list.rds"))
+saveRDS(lapply(cgga, `[[`, "data"), file.path(DIR_PROC, "cgga_clin_scores.rds"))
+log_msg("CGGA validation complete (v3.2).")
+```
+
+---
+
+# Layer 05b — Transcriptomic subtype: does the HALLMARK score track subtype?
+
+```{r layer-05b-subtype}
+suppressPackageStartupMessages({ library(GSVA); library(msigdbr); library(survival); library(gtsummary) })
+
+tcga_df  <- readRDS(file.path(DIR_PROC, "tcga_model_df.rds"))
+vst_tcga <- readRDS(file.path(DIR_PROC, "tcga_vst.rds"))
+subtype  <- readRDS(file.path(DIR_RAW,  "tcga_gbm_subtype.rds"))
+
+## ---- 1. Published TCGA labels: column detected, never assumed --------
+sub_cols <- grep("Transcriptome.Subtype|Expression.Subclass|Original.Subtype|Subclass",
+                 colnames(subtype), value = TRUE, ignore.case = TRUE)
+log_msg("Candidate subtype columns in TCGAquery_subtype table: ",
+        if (length(sub_cols)) paste(sub_cols, collapse = " | ") else "NONE")
+if (length(sub_cols) == 0)
+  stop("No subtype column found. Run names(subtype) and set sub_col by hand in this chunk.")
+sub_col <- sub_cols[1]
+recode_sub <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  out <- dplyr::case_when(
+    x %in% c("CL", "CLASSICAL")   ~ "Classical",
+    x %in% c("ME", "MES", "MESENCHYMAL") ~ "Mesenchymal",
+    x %in% c("PN", "PRONEURAL")   ~ "Proneural",
+    x %in% c("NE", "NEURAL")      ~ "Neural",
+    TRUE ~ NA_character_)
+  factor(out, levels = c("Classical", "Mesenchymal", "Proneural", "Neural"))
+}
+tcga_df$subtype_pub <- recode_sub(subtype[match(tcga_df$patient, subtype$patient), sub_col])
+log_msg("TCGA published subtype (", sub_col, "): ",
+        paste(names(table(tcga_df$subtype_pub, useNA = "ifany")),
+              table(tcga_df$subtype_pub, useNA = "ifany"), sep = "=", collapse = ", "))
+
+## ---- 2. GSVA assignment with Verhaak 2010 sets, all cohorts ---------
+c2 <- tryCatch(msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP"),
+               error = function(e) msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CGP"))
+verhaak <- c2 %>% dplyr::filter(grepl("^VERHAAK_GLIOBLASTOMA_", gs_name))
+verhaak <- split(verhaak$gene_symbol, verhaak$gs_name)
+log_msg("Verhaak sets: ", paste(names(verhaak), lengths(verhaak), sep = "=", collapse = ", "))
+stopifnot(length(verhaak) >= 3)
+
+assign_subtype <- function(mat) {
+  sc <- run_gsva(mat, verhaak)
+  best <- sub("VERHAAK_GLIOBLASTOMA_", "", rownames(sc)[apply(sc, 2, which.max)])
+  data.frame(patient = colnames(sc), subtype_gsva = recode_sub(best), stringsAsFactors = FALSE)
+}
+tcga_df <- dplyr::left_join(tcga_df, assign_subtype(vst_tcga), by = "patient")
+cg <- readRDS(file.path(DIR_RES, "cgga_cox_list.rds"))
+## v3.2: subtype GSVA on log2(RSEM + 1) for CGGA (same scale as Layer 05 and 06)
+for (k in names(cg)) cg[[k]]$data <- dplyr::left_join(cg[[k]]$data, assign_subtype(log2(cgga_expr[[k]] + 1)), by = "patient")
+
+## Concordance published vs GSVA (TCGA) -> Table S2
+conc <- table(Published = tcga_df$subtype_pub, GSVA = tcga_df$subtype_gsva, useNA = "ifany")
+print(conc)
+agree <- mean(as.character(tcga_df$subtype_pub) == as.character(tcga_df$subtype_gsva), na.rm = TRUE)
+log_msg(sprintf("TCGA subtype agreement (published vs GSVA), among labelled: %.1f%%", 100 * agree))
+ftS2 <- flextable::flextable(as.data.frame.matrix(conc) %>% tibble::rownames_to_column("Published \\ GSVA")) %>% ft_style()
+flextable::save_as_docx(ftS2, path = file.path(DIR_TAB, "TableS2_subtype_concordance.docx"))
+
+## ---- 3. Score by subtype: Kruskal-Wallis, per cohort -> Figure S2 ----
+long <- dplyr::bind_rows(
+  tcga_df %>% dplyr::transmute(cohort = "TCGA-GBM", subtype = subtype_gsva, glyco_z),
+  cg[["CGGA-693"]]$data %>% dplyr::transmute(cohort = "CGGA-693", subtype = subtype_gsva, glyco_z),
+  cg[["CGGA-325"]]$data %>% dplyr::transmute(cohort = "CGGA-325", subtype = subtype_gsva, glyco_z)) %>%
+  dplyr::filter(!is.na(subtype)) %>%
+  dplyr::mutate(cohort = factor(cohort, levels = c("TCGA-GBM", "CGGA-693", "CGGA-325")))
+kw <- long %>% dplyr::group_by(cohort) %>%
+  dplyr::summarise(n = dplyr::n(), kw_p = kruskal.test(glyco_z ~ subtype)$p.value, .groups = "drop")
+kw_pub <- kruskal.test(glyco_z ~ subtype_pub, data = tcga_df)$p.value
+print(kw); log_msg(sprintf("Kruskal-Wallis, TCGA published labels: p=%.3g", kw_pub))
+write.csv(kw, file.path(DIR_RES, "subtype_kruskal.csv"), row.names = FALSE)
+sub_med <- long %>% dplyr::group_by(cohort, subtype) %>%
+  dplyr::summarise(n = dplyr::n(), median_z = median(glyco_z), .groups = "drop")
+print(as.data.frame(sub_med))
+write.csv(sub_med, file.path(DIR_RES, "subtype_medians.csv"), row.names = FALSE)
+for (r in seq_len(nrow(sub_med)))
+  log_msg(sprintf("Median glyco_z %s / %s: %.2f (n=%d)", sub_med$cohort[r],
+                  sub_med$subtype[r], sub_med$median_z[r], sub_med$n[r]))
+
+gS2 <- ggplot(long, aes(subtype, glyco_z)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 0.8) +
+  facet_wrap(~cohort) +
+  labs(x = "Transcriptomic subtype (GSVA, Verhaak 2010 gene sets)",
+       y = "Glycolytic score (HALLMARK_GLYCOLYSIS, z)") +
+  theme_classic(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+save_fig(gS2, file.path(DIR_FIG, "FigureS2_glyco_by_subtype"), width = 8, height = 3.6)
+
+## ---- 4. Cox adjusted for subtype, per cohort -> Table S1 --------------
+fit_sub <- function(d, with_mgmt, term = "glyco_z") {
+  d <- d %>% dplyr::filter(!is.na(subtype_gsva)) %>%
+    dplyr::mutate(subtype_gsva = droplevels(relevel(subtype_gsva, ref = "Classical")))
+  rhs <- paste(term, "+ age", if (with_mgmt) "+ MGMT", "+ subtype_gsva")
+  coxph(as.formula(paste("Surv(OS.time, OS.event) ~", rhs)), data = d)
+}
+cox_sub <- list(
+  `TCGA-GBM`  = fit_sub(tcga_df, with_mgmt = "MGMT" %in% names(tcga_df)),
+  `CGGA-693`  = fit_sub(cg[["CGGA-693"]]$data, with_mgmt = cg[["CGGA-693"]]$mgmt_adjusted),
+  `CGGA-325`  = fit_sub(cg[["CGGA-325"]]$data, with_mgmt = cg[["CGGA-325"]]$mgmt_adjusted))
+for (k in names(cox_sub)) {
+  writeLines(capture.output(summary(cox_sub[[k]])),
+             file.path(DIR_RES, sprintf("cox_subtype_%s.txt", k)))
+  log_msg(sprintf("%s subtype-adjusted: HR(glyco_z)=%.2f p=%.2f", k,
+                  exp(coef(cox_sub[[k]])["glyco_z"]),
+                  summary(cox_sub[[k]])$coefficients["glyco_z", "Pr(>|z|)"]))
+}
+lab <- list(glyco_z ~ "Glycolytic score, per 1 SD", age ~ "Age, per year",
+            subtype_gsva ~ "Subtype (GSVA)")
+tblS1 <- gtsummary::tbl_merge(
+  lapply(cox_sub, function(f) {
+    l <- lab; if (any(grepl("MGMT", names(coef(f))))) l <- c(l, list(MGMT ~ "MGMT promoter"))
+    gtsummary::tbl_regression(f, exponentiate = TRUE, label = l)
+  }),
+  tab_spanner = names(cox_sub))
+flextable::save_as_docx(gtsummary::as_flex_table(tblS1) %>% ft_style(),
+                        path = file.path(DIR_TAB, "TableS1_cox_subtype.docx"))
+
+saveRDS(tcga_df, file.path(DIR_PROC, "tcga_model_df.rds"))   # now carries subtype columns
+saveRDS(cg,      file.path(DIR_RES, "cgga_cox_list.rds"))
+saveRDS(list(kw = kw, kw_pub = kw_pub, agree = agree, cox_sub = cox_sub),
+        file.path(DIR_RES, "subtype_results.rds"))
+log_msg("Layer 05b complete: Figure S2, Table S1, Table S2 exported.")
+```
+
+```{r layer-05b-inline, fig.width=8, fig.height=3.6}
+gS2
+```
+
+---
+
+# Layer 06 — Reconciliation with the Chen 2017 GGESS: does an outcome-trained glycolytic signature survive subtype adjustment?
+
+Design. Three constructions of the ten-gene signature, each standardised
+per cohort (per 1 SD):
+
+- **GGESS-pub**: the published risk score, `sum(coef_i * z(gene_i))`, only if
+  `CHEN2017_GGESS_COEF` was transcribed. This is the faithful replication.
+- **GGESS-rederived**: univariate Cox coefficient per gene estimated in the
+  TCGA IDH-wt cohort, then the weighted sum applied unchanged to CGGA. In
+  TCGA this is in-sample (optimistic by construction, which is the point:
+  it mimics the outcome-trained design); in CGGA it is a genuine external
+  test of a TCGA-trained score.
+- **GGESS-unweighted**: mean of the ten z-scores, no outcome information.
+
+For each construction and cohort: Cox `score + age + MGMT` (base) and
+`score + age + MGMT + subtype` (adjusted). Attenuation is reported as
+`1 - beta_adj / beta_base` on the log-HR scale. Kruskal-Wallis of each
+score across subtypes, and Spearman correlation with the HALLMARK score.
+
+This layer is skipped automatically while `CHEN2017_GGESS` is empty.
+
+```{r layer-06-skip-notice, eval=!RUN_LAYER06}
+log_msg("Layer 06 SKIPPED: CHEN2017_GGESS is empty. Transcribe the ten genes (and, if available, the published ",
+        "Cox coefficients) from Chen et al. 2017, J Genet Genomics 44:519-530, into Layer 00 and re-render.")
+if (file.exists(file.path(DIR_RES, "ggess_results.rds"))) file.remove(file.path(DIR_RES, "ggess_results.rds"))
+```
+
+```{r layer-06-ggess, eval=RUN_LAYER06}
+suppressPackageStartupMessages({ library(survival) })
+
+tcga_df  <- readRDS(file.path(DIR_PROC, "tcga_model_df.rds"))
+vst_tcga <- readRDS(file.path(DIR_PROC, "tcga_vst.rds"))
+cg       <- readRDS(file.path(DIR_RES, "cgga_cox_list.rds"))
+glyco_set <- readRDS(file.path(DIR_PROC, "glyco_set.rds"))
+
+## ---- 0. Gene availability -------------------------------------------
+avail <- list(
+  `TCGA-GBM` = intersect(CHEN2017_GGESS, rownames(vst_tcga)),
+  `CGGA-693` = intersect(CHEN2017_GGESS, rownames(cgga_expr[["CGGA-693"]])),
+  `CGGA-325` = intersect(CHEN2017_GGESS, rownames(cgga_expr[["CGGA-325"]])))
+for (k in names(avail))
+  log_msg(sprintf("GGESS genes present in %s: %d of %d (%s)", k, length(avail[[k]]),
+                  length(CHEN2017_GGESS), paste(setdiff(CHEN2017_GGESS, avail[[k]]), collapse = ",")))
+common <- Reduce(intersect, avail)
+log_msg(sprintf("GGESS genes common to all cohorts: %d (%s); overlap with HALLMARK_GLYCOLYSIS: %d",
+                length(common), paste(common, collapse = ","), length(intersect(common, glyco_set))))
+if (length(common) < 5) stop("Fewer than five GGESS genes are shared by all cohorts; check symbols.")
+
+## ---- 1. Per-cohort z-matrices (log2 for CGGA RSEM; VST already log-scale) ----
+zmat <- function(mat, genes, log_transform) {
+  m <- mat[genes, , drop = FALSE]
+  if (log_transform) m <- log2(m + 1)
+  t(apply(m, 1, zrow))            # genes x samples
+}
+Z <- list(
+  `TCGA-GBM` = zmat(vst_tcga, common, log_transform = FALSE),
+  `CGGA-693` = zmat(cgga_expr[["CGGA-693"]], common, log_transform = TRUE),
+  `CGGA-325` = zmat(cgga_expr[["CGGA-325"]], common, log_transform = TRUE))
+D <- list(`TCGA-GBM` = tcga_df, `CGGA-693` = cg[["CGGA-693"]]$data, `CGGA-325` = cg[["CGGA-325"]]$data)
+MG <- list(`TCGA-GBM` = "MGMT" %in% names(tcga_df),
+           `CGGA-693` = cg[["CGGA-693"]]$mgmt_adjusted,
+           `CGGA-325` = cg[["CGGA-325"]]$mgmt_adjusted)
+
+## ---- 2. Rederived weights: univariate Cox per gene in TCGA -------------
+uni <- lapply(common, function(g) {
+  d <- tcga_df; d$g <- as.numeric(Z[["TCGA-GBM"]][g, d$patient])
+  f <- coxph(Surv(OS.time, OS.event) ~ g, data = d)
+  ci <- summary(f)$conf.int["g", ]
+  data.frame(gene = g, coef = unname(coef(f)["g"]), HR = unname(ci[1]), lo = unname(ci[3]), hi = unname(ci[4]),
+             p = summary(f)$coefficients["g", "Pr(>|z|)"], in_HALLMARK = g %in% glyco_set)
+})
+uni <- do.call(rbind, uni)
+print(uni)
+write.csv(uni, file.path(DIR_RES, "ggess_tcga_univariate_cox.csv"), row.names = FALSE)
+w_rederived <- setNames(uni$coef, uni$gene)
+ftS3 <- flextable::flextable(uni %>% dplyr::mutate(across(c(coef, HR, lo, hi), ~ round(.x, 3)),
+                                                   p = signif(p, 2))) %>% ft_style() %>%
+  flextable::add_footer_lines("Univariate Cox regression per gene (z-scored VST expression) in the TCGA-GBM IDH-wildtype discovery cohort. These coefficients define the GGESS-rederived score, which is then applied unchanged to CGGA-693 and CGGA-325.")
+flextable::save_as_docx(ftS3, path = file.path(DIR_TAB, "TableS3_GGESS_gene_coefficients.docx"))
+
+## ---- 3. Build the three scores per cohort --------------------------------
+constructions <- list(rederived = w_rederived, unweighted = setNames(rep(1, length(common)), common))
+if (length(CHEN2017_GGESS_COEF) > 0) {
+  wp <- CHEN2017_GGESS_COEF[common]
+  if (any(is.na(wp))) stop("Published coefficients missing for: ", paste(common[is.na(wp)], collapse = ","))
+  constructions <- c(list(published = wp), constructions)
+}
+for (k in names(D)) {
+  for (cn in names(constructions)) {
+    w <- constructions[[cn]]
+    s <- as.numeric(colSums(Z[[k]][names(w), , drop = FALSE] * w))
+    names(s) <- colnames(Z[[k]])
+    D[[k]][[paste0("ggess_", cn)]] <- as.numeric(scale(s[D[[k]]$patient]))
+  }
+}
+
+## ---- 4. Cox base vs subtype-adjusted, per construction and cohort -------
+fit_pair <- function(d, term, with_mgmt) {
+  d <- d %>% dplyr::filter(!is.na(subtype_gsva)) %>%
+    dplyr::mutate(subtype_gsva = droplevels(relevel(subtype_gsva, ref = "Classical")))
+  d <- d[complete.cases(d[, c(term, "age", if (with_mgmt) "MGMT")]), ]
+  rhs0 <- paste(term, "+ age", if (with_mgmt) "+ MGMT")
+  f0 <- coxph(as.formula(paste("Surv(OS.time, OS.event) ~", rhs0)), data = d)
+  f1 <- coxph(as.formula(paste("Surv(OS.time, OS.event) ~", rhs0, "+ subtype_gsva")), data = d)
+  b0 <- unname(coef(f0)[term]); b1 <- unname(coef(f1)[term])
+  r0 <- hr_row(f0, "", term); r1 <- hr_row(f1, "", term)
+  data.frame(n = f0$n, deaths = f0$nevent,
+             HR_base = r0$HR, lo_base = r0$lo, hi_base = r0$hi, p_base = r0$p,
+             HR_adj  = r1$HR, lo_adj  = r1$lo, hi_adj  = r1$hi, p_adj  = r1$p,
+             attenuation = if (abs(b0) > 1e-8) 1 - b1 / b0 else NA_real_,
+             kw_p = kruskal.test(d[[term]] ~ d$subtype_gsva)$p.value,
+             rho_hallmark = suppressWarnings(cor(d[[term]], d$glyco_z, method = "spearman")))
+}
+t4 <- do.call(rbind, lapply(names(constructions), function(cn) {
+  do.call(rbind, lapply(names(D), function(k) {
+    r <- fit_pair(D[[k]], paste0("ggess_", cn), MG[[k]])
+    cbind(data.frame(construction = cn, cohort = k), r)
+  }))
+}))
+t4$cohort <- factor(t4$cohort, levels = names(D))
+print(t4)
+write.csv(t4, file.path(DIR_RES, "table4_ggess_values.csv"), row.names = FALSE)
+for (i in seq_len(nrow(t4)))
+  log_msg(sprintf("GGESS-%s %s: base HR %.2f (%.2f-%.2f) p=%.3f | +subtype HR %.2f (%.2f-%.2f) p=%.3f | attenuation %.0f%% | KW p=%.2g | rho(HALLMARK)=%.2f",
+                  t4$construction[i], t4$cohort[i], t4$HR_base[i], t4$lo_base[i], t4$hi_base[i], t4$p_base[i],
+                  t4$HR_adj[i], t4$lo_adj[i], t4$hi_adj[i], t4$p_adj[i], 100 * t4$attenuation[i],
+                  t4$kw_p[i], t4$rho_hallmark[i]))
+
+## ---- 5. Table 4 ------------------------------------------------------------
+cons_lab <- c(published = "GGESS, published weights", rederived = "GGESS, TCGA-rederived weights",
+              unweighted = "GGESS, unweighted")
+t4_disp <- data.frame(
+  Signature = cons_lab[t4$construction], Cohort = as.character(t4$cohort),
+  `n (deaths)` = sprintf("%d (%d)", t4$n, t4$deaths),
+  `HR per SD, age + MGMT` = sprintf("%.2f (%.2f, %.2f); p=%.3f", t4$HR_base, t4$lo_base, t4$hi_base, t4$p_base),
+  `HR per SD, + subtype` = sprintf("%.2f (%.2f, %.2f); p=%.3f", t4$HR_adj, t4$lo_adj, t4$hi_adj, t4$p_adj),
+  `Attenuation of log HR` = ifelse(is.na(t4$attenuation), "NA", sprintf("%.0f%%", 100 * t4$attenuation)),
+  `Kruskal-Wallis by subtype` = sprintf("p=%.2g", t4$kw_p),
+  `Spearman rho vs HALLMARK` = sprintf("%.2f", t4$rho_hallmark),
+  check.names = FALSE)
+ft4 <- flextable::flextable(t4_disp) %>% ft_style() %>%
+  flextable::add_footer_lines(values = c(
+    "Cox proportional hazards regression; every score standardised within cohort (per 1 SD). Subtype assigned by GSVA over the Verhaak 2010 gene sets (reference, classical). Attenuation = 1 - beta(adjusted)/beta(base) on the log hazard ratio scale.",
+    "TCGA-rederived weights are estimated in TCGA and therefore in-sample for that cohort; in CGGA they constitute an external test of a TCGA-trained score. Published weights are reproduced only if transcribed from Chen et al. 2017.",
+    "CI, confidence interval; GGESS, glycolytic gene expression signature score; HR, hazard ratio; SD, standard deviation."))
+flextable::save_as_docx(ft4, path = file.path(DIR_TAB, "Table4_GGESS_subtype_attenuation.docx"))
+
+## ---- 6. Figure 3: paired forest, base vs subtype-adjusted -------------
+fp3 <- rbind(
+  data.frame(construction = t4$construction, cohort = t4$cohort, model = "Age + MGMT",
+             HR = t4$HR_base, lo = t4$lo_base, hi = t4$hi_base),
+  data.frame(construction = t4$construction, cohort = t4$cohort, model = "Age + MGMT + subtype",
+             HR = t4$HR_adj, lo = t4$lo_adj, hi = t4$hi_adj))
+fp3$construction <- factor(cons_lab[fp3$construction], levels = cons_lab[names(constructions)])
+fp3$model <- factor(fp3$model, levels = c("Age + MGMT", "Age + MGMT + subtype"))
+g3 <- ggplot(fp3, aes(x = HR, y = cohort, colour = model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.2, position = position_dodge(width = 0.5)) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.5)) +
+  facet_wrap(~construction, ncol = 1) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("#0072B2", "#D55E00")) +
+  labs(x = "Hazard ratio per 1 SD (95% CI)", y = NULL, colour = "Cox model") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+save_fig(g3, file.path(DIR_FIG, "Figure3_GGESS_attenuation"), width = 6.5, height = 2.2 * length(constructions) + 1)
+
+## ---- 7. Figure S3: GGESS by subtype ---------------------------------------
+main_cn <- if ("published" %in% names(constructions)) "published" else "rederived"
+longS3 <- dplyr::bind_rows(lapply(names(D), function(k)
+  D[[k]] %>% dplyr::transmute(cohort = k, subtype = subtype_gsva, score = .data[[paste0("ggess_", main_cn)]]))) %>%
+  dplyr::filter(!is.na(subtype)) %>% dplyr::mutate(cohort = factor(cohort, levels = names(D)))
+gS3 <- ggplot(longS3, aes(subtype, score)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = 0.15, alpha = 0.3, size = 0.8) +
+  facet_wrap(~cohort) +
+  labs(x = "Transcriptomic subtype (GSVA, Verhaak 2010 gene sets)",
+       y = sprintf("GGESS (%s weights, z)", main_cn)) +
+  theme_classic(base_size = 11) + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+save_fig(gS3, file.path(DIR_FIG, "FigureS3_GGESS_by_subtype"), width = 8, height = 3.6)
+
+saveRDS(list(t4 = t4, uni = uni, common = common, constructions = names(constructions), main = main_cn),
+        file.path(DIR_RES, "ggess_results.rds"))
+saveRDS(D[["TCGA-GBM"]], file.path(DIR_PROC, "tcga_model_df.rds"))
+for (k in c("CGGA-693", "CGGA-325")) cg[[k]]$data <- D[[k]]
+saveRDS(cg, file.path(DIR_RES, "cgga_cox_list.rds"))
+log_msg("Layer 06 complete: Table 4, Table S3, Figure 3, Figure S3 exported.")
+```
+
+```{r layer-06-inline, eval=RUN_LAYER06, fig.width=6.5, fig.height=7}
+g3
+gS3
+```
+
+---
+
+# Layer 07 — Manuscript tables and figures
+
+```{r layer-07-manuscript-outputs}
+suppressPackageStartupMessages({ library(survival); library(gtsummary); library(flextable); library(officer) })
+
+tcga_df   <- readRDS(file.path(DIR_PROC, "tcga_model_df.rds"))
+cox_tcga  <- readRDS(file.path(DIR_RES,  "tcga_cox.rds"))
+cox_tbase <- readRDS(file.path(DIR_RES,  "tcga_cox_base.rds"))
+zph_tcga  <- readRDS(file.path(DIR_RES,  "tcga_cox_zph.rds"))
+cox_strat <- readRDS(file.path(DIR_RES,  "tcga_cox_agebandstrat.rds"))
+zph_strat <- readRDS(file.path(DIR_RES,  "tcga_cox_agebandstrat_zph.rds"))
+cgga      <- readRDS(file.path(DIR_RES,  "cgga_cox_list.rds"))
+subres    <- readRDS(file.path(DIR_RES,  "subtype_results.rds"))
+ggres     <- if (file.exists(file.path(DIR_RES, "ggess_results.rds"))) readRDS(file.path(DIR_RES, "ggess_results.rds")) else NULL
+lr_txt    <- readLines(file.path(DIR_RES, "tcga_KM_logrank.txt"))
+lr_p      <- as.numeric(sub("p = ", "", lr_txt[grepl("^p = ", lr_txt)]))
+cox_693 <- cgga[["CGGA-693"]]$cox; cox_325 <- cgga[["CGGA-325"]]$cox
+dd_693  <- cgga[["CGGA-693"]]$data; dd_325 <- cgga[["CGGA-325"]]$data
+mgmt_693 <- cgga[["CGGA-693"]]$mgmt_adjusted; mgmt_325 <- cgga[["CGGA-325"]]$mgmt_adjusted
+
+## ===== TABLE 1 =======================================================
+t1_block <- function(d, cohort) {
+  data.frame(Cohort = cohort, Age = d$age, Sex = harmonize_sex(d$sex),
+             OS_months = d$OS.time / DAYS_PER_MONTH,
+             Vital = factor(ifelse(d$OS.event == 1, "Dead", "Alive / censored"),
+                            levels = c("Alive / censored", "Dead")),
+             Glyco = d$glyco_gsva,
+             MGMT = harmonize_mgmt(d$MGMT),
+             Subtype = d$subtype_gsva,
+             OS.time = d$OS.time, OS.event = d$OS.event,
+             stringsAsFactors = FALSE)
+}
+t1 <- rbind(t1_block(tcga_df, "TCGA-GBM"), t1_block(dd_693, "CGGA-693"), t1_block(dd_325, "CGGA-325"))
+t1$Cohort <- factor(t1$Cohort, levels = c("TCGA-GBM", "CGGA-693", "CGGA-325"))
+sex_tab  <- table(t1$Cohort, t1$Sex,  useNA = "ifany")
+mgmt_tab <- table(t1$Cohort, t1$MGMT, useNA = "ifany")
+stopifnot(all(rowSums(sex_tab) == table(t1$Cohort)))
+## Log-rank across cohorts (replaces Kruskal on OS months, which ignored censoring)
+lr_cohort <- survdiff(Surv(OS.time, OS.event) ~ Cohort, data = t1)
+lr_cohort_p <- 1 - pchisq(lr_cohort$chisq, df = 2)
+
+tbl1 <- t1 %>% dplyr::select(-OS.time, -OS.event) %>%
+  tbl_summary(by = Cohort,
+              statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              digits = list(Glyco ~ 2, Age ~ 0, OS_months ~ 0),
+              missing = "no",
+              label = list(Age ~ "Age, years", Sex ~ "Sex",
+                           OS_months ~ "Overall survival, months",
+                           Vital ~ "Vital status",
+                           Glyco ~ "Glycolytic score (HALLMARK, GSVA)",
+                           MGMT ~ "MGMT promoter", Subtype ~ "Transcriptomic subtype (GSVA)")) %>%
+  add_overall(last = FALSE) %>%
+  add_p(include = -OS_months, test = list(all_continuous() ~ "kruskal.test")) %>%
+  modify_header(label ~ "**Characteristic**") %>% bold_labels()
+n_mgmt_by <- sapply(split(t1$MGMT, t1$Cohort), function(x) sum(!is.na(x)))
+ft1 <- as_flex_table(tbl1) %>% ft_style() %>%
+  flextable::add_footer_lines(values = c(
+    sprintf("Overall survival is described as median (Q1, Q3) of observed follow-up; the between-cohort comparison used a log-rank test (p = %.3f) and is reported in the text.", lr_cohort_p),
+    sprintf("MGMT promoter status: percentages refer to patients with a recorded result (TCGA-GBM n = %d; CGGA-693 n = %d; CGGA-325 n = %d).",
+            n_mgmt_by["TCGA-GBM"], n_mgmt_by["CGGA-693"], n_mgmt_by["CGGA-325"]),
+    "Transcriptomic subtype assigned by GSVA over the Verhaak 2010 gene sets (highest score); see Supplementary Table S2 for concordance with published TCGA labels.",
+    "GSVA, gene set variation analysis; MGMT, O6-methylguanine-DNA methyltransferase."))
+flextable::save_as_docx(ft1, path = file.path(DIR_TAB, "Table1_baseline_characteristics.docx"))
+log_msg("Table 1 exported.")
+
+## ===== TABLE 2 + FIGURE 1 ============================================
+t2 <- rbind(hr_row(cox_tcga, "TCGA-GBM (discovery)", "glyco_z"),
+            hr_row(cox_693,  "CGGA-693 (validation)", "glyco_z"),
+            hr_row(cox_325,  "CGGA-325 (validation)", "glyco_z"))
+t2$cindex_base <- c(summary(cox_tbase)$concordance[1],
+                    summary(cgga[["CGGA-693"]]$cox_base)$concordance[1],
+                    summary(cgga[["CGGA-325"]]$cox_base)$concordance[1])
+t2_age <- rbind(hr_row(cgga[["CGGA-693"]]$cox_age_only, "CGGA-693 (age only)", "glyco_z"),
+                hr_row(cgga[["CGGA-325"]]$cox_age_only, "CGGA-325 (age only)", "glyco_z"))
+write.csv(t2, file.path(DIR_RES, "table2_figure1_values.csv"), row.names = FALSE)
+write.csv(t2_age, file.path(DIR_RES, "table2_cgga_ageonly_values.csv"), row.names = FALSE)
+
+t2_disp <- data.frame(Cohort = t2$cohort,
+  `Patients (deaths)` = sprintf("%d (%d)", t2$n, t2$deaths),
+  `HR per 1 SD` = sprintf("%.2f", t2$HR), `95% CI` = sprintf("%.2f, %.2f", t2$lo, t2$hi),
+  `p-value` = sprintf("%.2f", t2$p),
+  `C-index, age + MGMT` = sprintf("%.2f", t2$cindex_base),
+  `C-index, + score` = sprintf("%.2f", t2$cindex), check.names = FALSE)
+adj_note <- if (mgmt_693 && mgmt_325)
+  "Multivariable Cox proportional hazards regression; every model was adjusted for age and MGMT promoter methylation status (identical specification in the three cohorts). The score was standardized within each cohort, so the hazard ratio is expressed per 1 standard deviation of the cohort-specific score." else
+  "Multivariable Cox proportional hazards regression. The TCGA model was adjusted for age and MGMT promoter status; CGGA models were adjusted for age (MGMT incomplete). The score was standardized within each cohort."
+ft2 <- flextable::flextable(t2_disp) %>% ft_style() %>%
+  flextable::add_footer_lines(values = c(adj_note,
+    "C-index: concordance of the covariate-only model (age + MGMT) and of the same model with the glycolytic score added, on identical complete cases.",
+    "CI, confidence interval; HR, hazard ratio; SD, standard deviation."))
+flextable::save_as_docx(ft2, path = file.path(DIR_TAB, "Table2_glycolytic_score_survival.docx"))
+
+fp <- t2; fp$cohort <- factor(fp$cohort, levels = rev(fp$cohort))
+fp$lab <- sprintf("%.2f (%.2f\u2013%.2f); p=%.2f", fp$HR, fp$lo, fp$hi, fp$p)
+g1 <- ggplot(fp, aes(y = cohort)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.18) +
+  geom_point(aes(x = HR), size = 3) +
+  geom_text(aes(x = 1.75, label = lab), hjust = 0, size = 3.1) +
+  annotate("text", x = 1.75, y = 3.55, label = "HR (95% CI); p", hjust = 0, size = 3.1, fontface = "bold") +
+  scale_x_log10(breaks = c(0.7, 0.85, 1, 1.2, 1.45), limits = c(0.66, 2.6), expand = c(0, 0)) +
+  scale_y_discrete(expand = expansion(add = c(0.5, 0.9))) +
+  labs(x = "Hazard ratio per 1 SD of glycolytic score (95% CI)", y = NULL) +
+  coord_cartesian(clip = "off") + theme_classic(base_size = 11) +
+  theme(axis.line.y = element_blank(), axis.ticks.y = element_blank(), plot.margin = margin(8, 8, 8, 8))
+save_fig(g1, file.path(DIR_FIG, "Figure1_forest_plot"), width = 6.5, height = 2.6)
+log_msg("Table 2 and Figure 1 exported: ", paste(fp$lab, collapse = " | "))
+
+## ===== Sensitivity: five-gene panel and sex-adjusted =================
+tcga_df$panel_z <- as.numeric(scale(tcga_df$panel_z))
+cox_panel <- coxph(Surv(OS.time, OS.event) ~ panel_z + age + MGMT, data = tcga_df)
+writeLines(capture.output(summary(cox_panel)), file.path(DIR_RES, "tcga_cox_panel5_summary.txt"))
+pn <- summary(cox_panel)$conf.int["panel_z", ]; pp <- summary(cox_panel)$coefficients["panel_z", "Pr(>|z|)"]
+
+sex_fit <- function(d, with_mgmt) {
+  d$sex <- harmonize_sex(d$sex)
+  rhs <- paste("glyco_z + age + sex", if (with_mgmt) "+ MGMT")
+  coxph(as.formula(paste("Surv(OS.time, OS.event) ~", rhs)), data = d)
+}
+cox_sex <- list(`TCGA-GBM (discovery)` = sex_fit(tcga_df, TRUE),
+                `CGGA-693 (validation)` = sex_fit(dd_693, mgmt_693),
+                `CGGA-325 (validation)` = sex_fit(dd_325, mgmt_325))
+t_sex <- do.call(rbind, Map(function(f, l) hr_row(f, l, "glyco_z"), cox_sex, names(cox_sex)))
+write.csv(t_sex, file.path(DIR_RES, "sensitivity_sex_adjusted_values.csv"), row.names = FALSE)
+
+## ===== TABLE 3 =======================================================
+zt <- zph_tcga$table; zs <- zph_strat$table
+st <- summary(cox_strat)$conf.int["glyco_z", ]; stp <- summary(cox_strat)$coefficients["glyco_z", "Pr(>|z|)"]
+lrt <- summary(cox_tcga)$logtest
+tbl3 <- tbl_regression(cox_tcga, exponentiate = TRUE,
+                       label = list(glyco_z ~ "Glycolytic score, per 1 SD", age ~ "Age, per year",
+                                    MGMT ~ "MGMT promoter")) %>% bold_labels()
+ft3 <- as_flex_table(tbl3) %>% ft_style() %>%
+  flextable::add_footer_lines(values = c(
+    sprintf("Multivariable Cox proportional hazards regression (n = %d, %d deaths). Concordance %.2f (SE %.3f); likelihood ratio test %.2f on %d df, p = %.3f.",
+            cox_tcga$n, cox_tcga$nevent, summary(cox_tcga)$concordance[1], summary(cox_tcga)$concordance[2],
+            lrt["test"], lrt["df"], lrt["pvalue"]),
+    sprintf("Proportional hazards held for the glycolytic score (scaled Schoenfeld residuals, p = %.2f) and for MGMT (p = %.3f); the global test was violated (p = %.3f), driven by age (p = %.4f). A sensitivity analysis stratifying by age tertile (n = %d, %d deaths) resolved the violation (global p = %.2f) and confirmed that the glycolytic score remained non-significant (HR %.2f, 95%% CI %.2f, %.2f; p = %.2f).",
+            zt["glyco_z", "p"], zt["MGMT", "p"], zt["GLOBAL", "p"], zt["age", "p"],
+            cox_strat$n, cox_strat$nevent, zs["GLOBAL", "p"], st["exp(coef)"], st["lower .95"], st["upper .95"], stp),
+    "CI, confidence interval; HR, hazard ratio; SD, standard deviation; MGMT, O6-methylguanine-DNA methyltransferase."))
+flextable::save_as_docx(ft3, path = file.path(DIR_TAB, "Table3_TCGA_multivariable_Cox.docx"))
+
+## ===== manuscript_numbers.txt ========================================
+med <- function(x) sprintf("%.2f (%.2f, %.2f)", median(x, na.rm = TRUE), quantile(x, .25, na.rm = TRUE), quantile(x, .75, na.rm = TRUE))
+score_p <- kruskal.test(Glyco ~ Cohort, data = t1)$p.value
+age_p   <- kruskal.test(Age ~ Cohort, data = t1)$p.value
+sex_p   <- chisq.test(table(t1$Cohort, t1$Sex))$p.value
+mgmt_p  <- chisq.test(table(t1$Cohort, t1$MGMT))$p.value
+subhr <- function(k) { f <- subres$cox_sub[[k]]; ci <- summary(f)$conf.int["glyco_z", ]
+  sprintf("%s subtype-adjusted: HR %.2f (95%% CI %.2f-%.2f), p=%.2f", k, ci[1], ci[3], ci[4],
+          summary(f)$coefficients["glyco_z", 5]) }
+nums <- c(
+  "Numbers cited in the manuscript (Layer 07, pipeline v3.2)",
+  sprintf("Generated: %s | CGGA_PRIMARY_ONLY=%s | CGGA_ADJUST_MGMT=%s", format(Sys.time(), "%Y-%m-%d %H:%M"),
+          CGGA_PRIMARY_ONLY, CGGA_ADJUST_MGMT), "",
+  sprintf("Pooled IDH-wt GBM: n = %d (TCGA %d, CGGA-693 %d, CGGA-325 %d); deaths %d",
+          nrow(t1), sum(t1$Cohort=="TCGA-GBM"), sum(t1$Cohort=="CGGA-693"), sum(t1$Cohort=="CGGA-325"), sum(t1$Vital=="Dead")),
+  sprintf("Adjusted models: n = %d (TCGA %d, CGGA-693 %d, CGGA-325 %d); deaths %d", sum(t2$n), t2$n[1], t2$n[2], t2$n[3], sum(t2$deaths)),
+  sprintf("Age median (Q1,Q3): TCGA %s; CGGA-693 %s; CGGA-325 %s; Kruskal p=%.3g",
+          med(t1$Age[t1$Cohort=="TCGA-GBM"]), med(t1$Age[t1$Cohort=="CGGA-693"]), med(t1$Age[t1$Cohort=="CGGA-325"]), age_p),
+  sprintf("OS months median (Q1,Q3) of observed follow-up: TCGA %s; CGGA-693 %s; CGGA-325 %s; log-rank across cohorts p=%.3g",
+          med(t1$OS_months[t1$Cohort=="TCGA-GBM"]), med(t1$OS_months[t1$Cohort=="CGGA-693"]), med(t1$OS_months[t1$Cohort=="CGGA-325"]), lr_cohort_p),
+  sprintf("Sex (F/M): TCGA %d/%d; CGGA-693 %d/%d; CGGA-325 %d/%d; chi-square p=%.2f",
+          sex_tab["TCGA-GBM","Female"], sex_tab["TCGA-GBM","Male"], sex_tab["CGGA-693","Female"], sex_tab["CGGA-693","Male"],
+          sex_tab["CGGA-325","Female"], sex_tab["CGGA-325","Male"], sex_p),
+  sprintf("MGMT unmethylated (n/known): TCGA %d/%d; CGGA-693 %d/%d; CGGA-325 %d/%d; chi-square p=%.3f",
+          mgmt_tab["TCGA-GBM","Unmethylated"], n_mgmt_by["TCGA-GBM"], mgmt_tab["CGGA-693","Unmethylated"], n_mgmt_by["CGGA-693"],
+          mgmt_tab["CGGA-325","Unmethylated"], n_mgmt_by["CGGA-325"], mgmt_p),
+  sprintf("Glycolytic score median (Q1,Q3): overall %s; TCGA %s; CGGA-693 %s; CGGA-325 %s; Kruskal p=%.2f",
+          med(t1$Glyco), med(t1$Glyco[t1$Cohort=="TCGA-GBM"]), med(t1$Glyco[t1$Cohort=="CGGA-693"]), med(t1$Glyco[t1$Cohort=="CGGA-325"]), score_p),
+  "",
+  sprintf("%s: HR %.2f (95%% CI %.2f-%.2f), p=%.2f, C base=%.2f, C +score=%.2f", t2$cohort, t2$HR, t2$lo, t2$hi, t2$p, t2$cindex_base, t2$cindex),
+  sprintf("%s: HR %.2f (95%% CI %.2f-%.2f), p=%.2f  [age-only specification]", t2_age$cohort, t2_age$HR, t2_age$lo, t2_age$hi, t2_age$p),
+  sprintf("Largest validation cohort upper CI bound: %.2f", t2$hi[2]), "",
+  sprintf("TCGA age: HR %.2f (95%% CI %.2f-%.2f), p=%.3f", summary(cox_tcga)$conf.int["age",1],
+          summary(cox_tcga)$conf.int["age",3], summary(cox_tcga)$conf.int["age",4], summary(cox_tcga)$coefficients["age",5]),
+  sprintf("TCGA MGMT unmethylated: HR %.2f (95%% CI %.2f-%.2f), p=%.3f", summary(cox_tcga)$conf.int["MGMTUnmethylated",1],
+          summary(cox_tcga)$conf.int["MGMTUnmethylated",3], summary(cox_tcga)$conf.int["MGMTUnmethylated",4],
+          summary(cox_tcga)$coefficients["MGMTUnmethylated",5]),
+  sprintf("KM by tertile log-rank p = %.2f", lr_p),
+  sprintf("Schoenfeld: glyco p=%.2f, age p=%.4f, MGMT p=%.3f, global p=%.3f", zt["glyco_z","p"], zt["age","p"], zt["MGMT","p"], zt["GLOBAL","p"]),
+  sprintf("Age-band-stratified: glyco HR %.2f (95%% CI %.2f-%.2f), p=%.2f; global p=%.2f", st["exp(coef)"], st["lower .95"], st["upper .95"], stp, zs["GLOBAL","p"]),
+  sprintf("Five-gene panel: HR %.2f (95%% CI %.2f-%.2f), p=%.2f", pn["exp(coef)"], pn["lower .95"], pn["upper .95"], pp),
+  sprintf("Sex-adjusted %s: HR %.2f (95%% CI %.2f-%.2f), p=%.2f", t_sex$cohort, t_sex$HR, t_sex$lo, t_sex$hi, t_sex$p),
+  "",
+  "--- Subtype (Layer 05b) ---",
+  sprintf("Kruskal-Wallis glyco_z ~ subtype (GSVA): %s", paste(sprintf("%s p=%.3g (n=%d)", subres$kw$cohort, subres$kw$kw_p, subres$kw$n), collapse = "; ")),
+  sprintf("Kruskal-Wallis glyco_z ~ published TCGA subtype: p=%.3g", subres$kw_pub),
+  sprintf("TCGA published vs GSVA subtype agreement: %.1f%%", 100 * subres$agree),
+  vapply(names(subres$cox_sub), subhr, ""),
+  "",
+  "--- Chen 2017 GGESS reconciliation (Layer 06) ---")
+if (is.null(ggres)) {
+  nums <- c(nums, "Layer 06 not run: CHEN2017_GGESS empty (transcribe genes into Layer 00 and re-render).")
+} else {
+  t4 <- ggres$t4
+  nums <- c(nums,
+    sprintf("GGESS genes common to all cohorts: %s", paste(ggres$common, collapse = ", ")),
+    sprintf("Constructions: %s (main for Figure S3: %s)", paste(ggres$constructions, collapse = ", "), ggres$main),
+    sprintf("GGESS-%s %s: age+MGMT HR %.2f (%.2f-%.2f) p=%.3f | +subtype HR %.2f (%.2f-%.2f) p=%.3f | attenuation %.0f%% | KW p=%.2g | rho HALLMARK %.2f",
+            t4$construction, t4$cohort, t4$HR_base, t4$lo_base, t4$hi_base, t4$p_base,
+            t4$HR_adj, t4$lo_adj, t4$hi_adj, t4$p_adj, 100 * t4$attenuation, t4$kw_p, t4$rho_hallmark))
+}
+writeLines(nums, file.path(DIR_OUT, "manuscript_numbers.txt")); cat(nums, sep = "\n")
+
+outs <- list.files(DIR_OUT, full.names = TRUE, recursive = TRUE)
+writeLines(sprintf("%s\t%d bytes\t%s", sub(paste0(DIR_OUT, "/"), "", outs), file.size(outs),
+                   format(file.mtime(outs), "%Y-%m-%d %H:%M:%S")),
+           file.path(DIR_OUT, "MANIFEST.txt"))
+log_msg(sprintf("Layer 07 complete: %d files under Sep_06/.", length(outs)))
+```
+
+```{r layer-07-inline, fig.width=6.5, fig.height=2.6}
+g1
+tbl1
+tbl3
+```
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

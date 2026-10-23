@@ -1,0 +1,10 @@
+data_raw/
+data_processed/
+results/
+logs/
+Sep_06/
+*.rds
+*.html
+.Rhistory
+.RData
+.DS_Store
